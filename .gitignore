@@ -1,0 +1,4 @@
+.neptune_tok
+__pycache__/*
+checkpoints_ar/*
+checkpoints_card/*

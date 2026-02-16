@@ -38,6 +38,7 @@ import os
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+import neptune
 
 
 # =============================================================================
@@ -152,6 +153,9 @@ def parse_args():
     g.add_argument("--eval_interval", type=int, default=1000)
     g.add_argument("--save_interval", type=int, default=5000)
     g.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
+    g.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
+                   help="Device to use for training (cuda, cpu, or specific device like cuda:0)")
+    g.add_argument("--no-log", action="store_true", help="Disable Neptune logging")
 
     args = p.parse_args()
 
@@ -168,6 +172,68 @@ def parse_args():
 
 
 # =============================================================================
+# Neptune Logging
+# =============================================================================
+
+def init_neptune_run(no_log: bool = False, project: str = "halcyon/card", token_file: str = ".neptune_tok"):
+    """
+    Initialize a Neptune run for experiment tracking.
+
+    Args:
+        no_log: If True, skip Neptune initialization
+        project: Neptune project name (workspace/project)
+        token_file: Path to file containing Neptune API token (first line)
+
+    Returns:
+        Neptune run object, or None if initialization fails or disabled
+    """
+    if no_log:
+        logging.info("Neptune logging disabled via --no-log flag")
+        return None
+
+    try:
+        # Read API token from file
+        if not os.path.exists(token_file):
+            logging.warning(f"Neptune token file '{token_file}' not found. Skipping Neptune logging.")
+            return None
+
+        with open(token_file, 'r') as f:
+            api_token = f.readline().strip()
+
+        # Initialize Neptune run
+        run = neptune.init_run(
+            project=project,
+            api_token=api_token,
+        )
+        logging.info(f"Neptune run initialized: {run.get_url()}")
+        return run
+
+    except Exception as e:
+        logging.warning(f"Failed to initialize Neptune: {e}. Continuing without Neptune logging.")
+        return None
+
+
+def log_parameters_to_neptune(run, args):
+    """
+    Log training parameters to Neptune.
+
+    Args:
+        run: Neptune run object (can be None)
+        args: Parsed arguments from argparse
+    """
+    if run is None:
+        return
+
+    try:
+        # Convert args to dict and log all parameters
+        params = vars(args)
+        run["parameters"] = params
+        logging.info("Parameters logged to Neptune")
+    except Exception as e:
+        logging.warning(f"Failed to log parameters to Neptune: {e}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -181,6 +247,10 @@ def main():
 
     args = parse_args()
 
+    # Initialize Neptune for experiment tracking
+    neptune_run = init_neptune_run(no_log=args.no_log)
+    log_parameters_to_neptune(neptune_run, args)
+
     logging.info("=" * 60)
     logging.info(f"{'CARD' if args.mode == 'card' else 'AR'} Training")
     logging.info("=" * 60)
@@ -193,13 +263,16 @@ def main():
     eval_ds = WikiTextDataset("validation", args.seq_len, args.dataset, args.tokenizer)
     vocab_size = train_ds.vocab_size
 
+    # pin_memory should only be True when using CUDA
+    use_pin_memory = args.device.startswith("cuda")
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        num_workers=args.num_workers, pin_memory=use_pin_memory, drop_last=True,
     )
     eval_loader = DataLoader(
         eval_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=use_pin_memory,
     )
 
     # --- Model (shared architecture) ---
@@ -241,8 +314,9 @@ def main():
             eval_interval=args.eval_interval,
             save_interval=args.save_interval,
             output_dir=args.output_dir,
+            device=args.device,
         )
-        trainer = CARDTrainer(model, train_loader, eval_loader, trainer_config)
+        trainer = CARDTrainer(model, train_loader, eval_loader, trainer_config, neptune_run=neptune_run)
     else:
         from ar_trainer import ARTrainer, ARTrainerConfig
         trainer_config = ARTrainerConfig(
@@ -258,13 +332,20 @@ def main():
             eval_interval=args.eval_interval,
             save_interval=args.save_interval,
             output_dir=args.output_dir,
+            device=args.device,
         )
-        trainer = ARTrainer(model, train_loader, eval_loader, trainer_config)
+        trainer = ARTrainer(model, train_loader, eval_loader, trainer_config, neptune_run=neptune_run)
 
     if args.resume:
         trainer.load_checkpoint(args.resume)
 
     trainer.train()
+
+    # Stop Neptune run
+    if neptune_run is not None:
+        neptune_run.stop()
+        logging.info("Neptune run stopped")
+
     logging.info("Done.")
 
 

@@ -65,11 +65,13 @@ class ARTrainer:
         train_loader: DataLoader,
         eval_loader: Optional[DataLoader],
         config: ARTrainerConfig,
+        neptune_run=None,
     ):
         self.model = model.to(config.device)
         self.train_loader = train_loader
         self.eval_loader = eval_loader
         self.config = config
+        self.neptune_run = neptune_run
 
         fused = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
         self.optimizer = torch.optim.AdamW(
@@ -77,18 +79,21 @@ class ARTrainer:
             lr=config.learning_rate,
             betas=config.betas,
             weight_decay=config.weight_decay,
-            fused=fused and config.device == "cuda",
+            fused=fused and config.device.startswith("cuda"),
         )
 
         self.scheduler = self._build_cosine_schedule()
-        self.use_amp = config.use_amp and torch.cuda.is_available()
-        self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # Determine device type for autocast (cuda or cpu)
+        self.device_type = "cuda" if config.device.startswith("cuda") else "cpu"
+        self.use_amp = config.use_amp and self.device_type == "cuda"
+        self.amp_dtype = torch.bfloat16 if (self.device_type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
 
         self.global_step = 0
         self.best_eval_loss = float("inf")
         os.makedirs(config.output_dir, exist_ok=True)
 
         logger.info(f"AR Trainer | {model.count_parameters():,} params")
+        logger.info(f"  Device: {config.device} | AMP: {self.use_amp} ({self.amp_dtype})")
 
     def _build_cosine_schedule(self):
         cfg = self.config
@@ -105,7 +110,7 @@ class ARTrainer:
         x = batch.to(cfg.device)
         input_ids, targets = x[:, :-1], x[:, 1:]
 
-        with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+        with torch.autocast(device_type=self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
             logits, _ = self.model(input_ids)  # (B, L-1, V)
             loss = F.cross_entropy(
                 logits.reshape(-1, self.model.config.vocab_size),
@@ -117,25 +122,43 @@ class ARTrainer:
         return loss.item() * cfg.gradient_accumulation_steps
 
     @torch.no_grad()
-    def evaluate(self) -> float:
+    def evaluate(self) -> tuple:
+        """
+        Evaluate the model on validation data.
+
+        Returns:
+            (loss, accuracy, tokens_per_sec): average loss per token, accuracy, and throughput
+        """
         if self.eval_loader is None:
-            return float("nan")
+            return float("nan"), float("nan"), float("nan")
         self.model.eval()
-        total_loss, total_tokens = 0.0, 0
+        total_loss, total_tokens, correct_tokens = 0.0, 0, 0
+        start_time = time.time()
+
         for batch in self.eval_loader:
             x = batch.to(self.config.device)
             input_ids, targets = x[:, :-1], x[:, 1:]
-            with torch.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+            with torch.autocast(device_type=self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                 logits, _ = self.model(input_ids)
                 loss = F.cross_entropy(
                     logits.reshape(-1, self.model.config.vocab_size),
                     targets.reshape(-1),
                     reduction="sum",
                 )
+
+                # Compute accuracy
+                predictions = logits.argmax(dim=-1)
+                correct_tokens += (predictions == targets).sum().item()
+
             total_loss += loss.item()
             total_tokens += targets.numel()
+
+        elapsed_time = time.time() - start_time
         self.model.train()
-        return total_loss / max(total_tokens, 1)
+        avg_loss = total_loss / max(total_tokens, 1)
+        accuracy = correct_tokens / max(total_tokens, 1)
+        tokens_per_sec = total_tokens / max(elapsed_time, 1e-6)
+        return avg_loss, accuracy, tokens_per_sec
 
     def save_checkpoint(self, path: Optional[str] = None):
         path = path or os.path.join(self.config.output_dir, f"ar_step_{self.global_step}.pt")
@@ -195,12 +218,33 @@ class ARTrainer:
                     f"[AR]   step {self.global_step:>7d} | loss {avg:.4f} | "
                     f"lr {lr:.2e} | {tps:.0f} tok/s"
                 )
+
+                # Log to Neptune
+                if self.neptune_run is not None:
+                    try:
+                        self.neptune_run["train/loss"].append(avg, step=self.global_step)
+                        self.neptune_run["train/learning_rate"].append(lr, step=self.global_step)
+                        self.neptune_run["train/tokens_per_sec"].append(tps, step=self.global_step)
+                    except Exception as e:
+                        logger.warning(f"Failed to log to Neptune: {e}")
+
                 accum_loss = 0.0
 
             if self.global_step % cfg.eval_interval == 0:
-                val_loss = self.evaluate()
+                val_loss, val_acc, val_tps = self.evaluate()
                 val_ppl = math.exp(min(val_loss, 20))
-                logger.info(f"  eval loss={val_loss:.4f} ppl={val_ppl:.2f}")
+                logger.info(f"  eval loss={val_loss:.4f} ppl={val_ppl:.2f} acc={val_acc:.4f} | {val_tps:.0f} tok/s")
+
+                # Log to Neptune
+                if self.neptune_run is not None:
+                    try:
+                        self.neptune_run["val/loss"].append(val_loss, step=self.global_step)
+                        self.neptune_run["val/ppl"].append(val_ppl, step=self.global_step)
+                        self.neptune_run["val/acc"].append(val_acc, step=self.global_step)
+                        self.neptune_run["val/tokens_per_sec"].append(val_tps, step=self.global_step)
+                    except Exception as e:
+                        logger.warning(f"Failed to log eval metrics to Neptune: {e}")
+
                 if val_loss < self.best_eval_loss:
                     self.best_eval_loss = val_loss
                     self.save_checkpoint(
