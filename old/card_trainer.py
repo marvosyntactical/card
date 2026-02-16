@@ -1,537 +1,483 @@
 """
-CARD Trainer: Training loop for Causal Autoregressive Diffusion LM
-===================================================================
-Implements the full Algorithm 1 from the paper:
-  1. Noise scheduling:        t ~ U[0, 1]
-  2. Soft tail masking:       concentrate corruption at sequence tail
-  3. Context-aware reweighting: downweight predictions in ambiguous contexts
-  4. Optimization:             weighted cross-entropy with cosine LR schedule
+card_trainer.py — CARD Training Loop (Algorithm 1)
+====================================================
 
-The key insight: this training loop has almost the same cost as standard
-autoregressive LM training. The overhead is just the masking (O(L)) and
-weight computation (O(L)), both negligible compared to the transformer forward.
+Implements the full training procedure from the paper:
+  1. Noise scheduling:             t ~ U[0, 1], σ(t) = t (linear)
+  2. Soft tail masking:            Section 3.2, Algorithm 1 lines 6-11
+  3. Context-aware reweighting:    Section 3.3, Algorithm 1 lines 13-17
+  4. Dense supervision:            Loss on ALL positions (100% token utilization)
+  5. Cosine LR with warmup:        Table 6
+
+Key corrections from naive implementation:
+  - NO timestep conditioning in the model (Eq. 5 has no explicit t)
+  - Reweighting exponent is (n-1-i) not (n-i) (Algorithm 1, line 15)
+  - Loss is on ALL positions, not just masked ones (Section 3.1)
+  - The model is a standard GPT — all CARD logic is in this trainer
 """
 
 import os
 import time
 import math
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from card_model import CARDModel
+from model import CausalLM, ModelConfig
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TrainerConfig:
-    """
-    Training hyperparameters. Defaults match Table 6 of the CARD paper.
+class CARDTrainerConfig:
+    """Training hyperparameters. Defaults from Table 6 + Algorithm 1."""
 
-    The paper trains a 1B-param model on 300B tokens from FineWeb.
-    For WikiText training (much smaller), you'll want to reduce model size
-    and training steps — see the CLI defaults in train.py.
-    """
-    # Optimizer
+    # Optimizer (Table 6)
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
     max_grad_norm: float = 1.0
 
-    # Schedule
+    # Schedule (Table 6: "Cosine w/ Warmup")
     warmup_steps: int = 2500
-    max_steps: int = 1_000_000
-    lr_scheduler: str = "cosine"  # Paper says "Cosine w/ Warmup"
+    max_steps: int = 100_000
 
-    # CARD-specific diffusion hyperparameters
-    tail_factor: float = 1.5     # λ: controls soft tail masking window width
-    reweight_beta: float = 1.0   # β: smoothing constant for context-aware weights
-    reweight_decay: float = 0.5  # p: exponential decay factor for noise distance
+    # CARD diffusion hyperparameters (Algorithm 1, line 2)
+    tail_factor: float = 1.5     # λ: window width multiplier (λ=1 → strict tail)
+    reweight_beta: float = 1.0   # β: smoothing constant (Algorithm 1, line 16)
+    reweight_decay: float = 0.5  # p: distance decay factor (Algorithm 1, line 15)
 
     # Training
     batch_size: int = 64
     gradient_accumulation_steps: int = 1
-    use_amp: bool = True         # BF16 mixed precision (paper uses BF16)
+    use_amp: bool = True
 
-    # Logging & checkpointing
+    # Logging & saving
     log_interval: int = 100
     eval_interval: int = 1000
     save_interval: int = 5000
-    output_dir: str = "./checkpoints"
+    output_dir: str = "./checkpoints_card"
 
-    # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# =============================================================================
+# SOFT TAIL MASKING — Section 3.2, Algorithm 1 lines 6-11
+# =============================================================================
+
+def soft_tail_masking(
+    x0: torch.Tensor,
+    t: torch.Tensor,
+    mask_token_id: int,
+    tail_factor: float = 1.5,
+) -> torch.Tensor:
+    """
+    Corrupt clean sequences by concentrating [MASK] tokens at the tail.
+
+    WHY NOT UNIFORM MASKING?
+    Under causal attention, position n can only see positions < n.
+    If early positions are masked, the model has no signal to predict from.
+    Example: if positions 0-3 are all [MASK], predicting position 4 is
+    pure guessing because the entire causal context is noise.
+
+    SOFT TAIL MASKING SOLUTION:
+    1. Compute N = ⌊L·t⌋ tokens to mask
+    2. Define a window of size W = ⌊N·λ⌋ at the sequence tail
+    3. Randomly place N masks within this window of W positions
+
+    The window is WIDER than N (since λ > 1), creating a mix of clean
+    and masked tokens in the tail. This preserves local context even
+    in the corrupted region (Proposition 2: higher MI than uniform).
+
+    Example (L=10, t=0.3, λ=1.5):
+        N = 3 masks, W = 4 positions
+        Clean prefix:  [tok] [tok] [tok] [tok] [tok] [tok]
+        Tail window:                                       [tok] [MASK] [MASK] [MASK]
+                                                           ^--- window of 4, 3 masked
+
+    Args:
+        x0:            (B, L) clean token ids
+        t:             (B,)   noise levels in [0, 1]
+        mask_token_id: id for [MASK]
+        tail_factor:   λ from Algorithm 1
+    Returns:
+        x_t: (B, L) corrupted sequences
+    """
+    B, L = x0.shape
+    device = x0.device
+    x_t = x0.clone()
+
+    # Algorithm 1, line 6
+    N = torch.clamp((L * t).floor().long(), min=1)   # (B,) number to mask
+    W = torch.clamp((N.float() * tail_factor).floor().long(), max=L)  # (B,) window size
+
+    for b in range(B):
+        n, w = N[b].item(), W[b].item()
+        # Algorithm 1, line 7: sample n indices from the last w positions
+        window_start = L - w
+        perm = torch.randperm(w, device=device)[:n]
+        x_t[b, window_start + perm] = mask_token_id
+
+    return x_t
+
+
+# =============================================================================
+# CONTEXT-AWARE REWEIGHTING — Section 3.3, Algorithm 1 lines 13-17
+# =============================================================================
+
+def compute_context_aware_weights(
+    x_t: torch.Tensor,
+    mask_token_id: int,
+    beta: float = 1.0,
+    decay: float = 0.5,
+) -> torch.Tensor:
+    """
+    Per-token loss weights that downweight predictions from ambiguous contexts.
+
+    The weight for position n depends on three properties of its causal
+    context x^t_{<n} (Section 3.3):
+
+    QUANTITY — total masked tokens in context:
+        Accumulated via the summation Σ_{i=1}^{n}.
+
+    DISTANCE — proximity of masks to position n:
+        Nearby masks matter more. Decay factor (1-p)^{n-1-i} gives
+        exponential decay. With p=0.5: a mask 1 position away has 2×
+        the impact of one 2 positions away. This follows the finding
+        that LM context relevance decays exponentially (Khandelwal 2018).
+
+    DENSITY — consecutive mask spans:
+        C_i = 𝟙[x_i = MASK] · (1 + 𝟙[x_{i-1} = MASK])
+        Isolated mask → cost 1. Consecutive masks → cost 2.
+        Spans sever ALL local dependencies, making prediction harder.
+
+    Combined into (Algorithm 1, lines 14-16):
+        S^local_n = Σ_{i=1}^{n} C_i · (1-p)^{n-1-i}
+        w_n = (β + S^local_n)^{-1}
+
+    Proposition 1 proves this is inverse-variance weighting that minimizes
+    the variance of stochastic gradients, stabilizing optimization without
+    requiring aggressive EMA.
+
+    Args:
+        x_t:           (B, L) corrupted tokens
+        mask_token_id: [MASK] id
+        beta:          β smoothing (prevents div by zero, default 1.0)
+        decay:         p decay factor (default 0.5 as in paper)
+    Returns:
+        weights: (B, L) per-position loss weights
+    """
+    B, L = x_t.shape
+    device = x_t.device
+    retain = 1.0 - decay  # (1-p), the retention factor
+
+    is_mask = (x_t == mask_token_id).float()  # (B, L)
+
+    # Algorithm 1, line 14: C_n = 𝟙[x_n is MASK] · (1 + 𝟙[x_{n-1} is MASK])
+    prev_mask = F.pad(is_mask[:, :-1], (1, 0), value=0.0)  # shifted right
+    C = is_mask * (1.0 + prev_mask)  # (B, L)
+
+    # Algorithm 1, line 15: S^local_n = Σ_{i=1}^{n} C_i · (1-p)^{n-1-i}
+    # This is a first-order IIR filter: S_n = C_n + retain · S_{n-1}
+    # Note the exponent is (n-1-i), which means:
+    #   S_1 = C_1 · (1-p)^0 = C_1
+    #   S_2 = C_2 · (1-p)^0 + C_1 · (1-p)^1 = C_2 + retain·C_1 = C_2 + retain·S_1
+    # So the recurrence is: S_n = C_n + retain · S_{n-1}  ✓
+    S_local = torch.zeros(B, L, device=device)
+    s = torch.zeros(B, device=device)
+    for n in range(L):
+        s = C[:, n] + retain * s
+        S_local[:, n] = s
+
+    # Algorithm 1, line 16: w_n = (β + S^local_n)^{-1}
+    weights = 1.0 / (beta + S_local)
+
+    return weights
+
+
+# =============================================================================
+# Trainer Class
+# =============================================================================
+
 class CARDTrainer:
     """
-    Trainer for the CARD model.
+    Trainer for CARD (Causal Autoregressive Diffusion).
 
-    Implements the complete training procedure from Algorithm 1:
-      - Soft Tail Masking (Section 3.2)
-      - Context-Aware Reweighting (Section 3.3)
-      - Cosine LR schedule with warmup (Table 6)
-      - BF16 mixed-precision training
+    The model is a standard CausalLM (GPT). All CARD-specific logic —
+    masking, reweighting, noise scheduling — lives here in the trainer,
+    not in the model architecture.
 
-    Usage:
-        model = CARDModel(...)
-        trainer = CARDTrainer(model, train_loader, eval_loader, config)
-        trainer.train()
+    This separation means:
+      - Same model class for CARD and AR (fair comparison)
+      - CARD training cost ≈ AR training cost (same forward pass)
+      - The model can be used for AR generation after CARD training
     """
 
     def __init__(
         self,
-        model: CARDModel,
+        model: CausalLM,
         train_loader: DataLoader,
         eval_loader: Optional[DataLoader],
-        config: TrainerConfig,
+        config: CARDTrainerConfig,
+        neptune_run=None,
     ):
         self.model = model.to(config.device)
         self.train_loader = train_loader
         self.eval_loader = eval_loader
         self.config = config
+        self.mask_token_id = model.config.mask_token_id
+        self.neptune_run = neptune_run
 
-        # Optimizer: AdamW as specified in Table 6
+        # AdamW with fused kernel if available (faster on CUDA)
+        fused = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
             betas=config.betas,
             weight_decay=config.weight_decay,
+            fused=fused and config.device.startswith("cuda"),
         )
 
-        # LR scheduler: cosine annealing with linear warmup
-        self.scheduler = self._build_scheduler()
+        self.scheduler = self._build_cosine_schedule()
+        # Determine device type for autocast (cuda or cpu)
+        self.device_type = "cuda" if config.device.startswith("cuda") else "cpu"
+        self.use_amp = config.use_amp and self.device_type == "cuda"
+        self.amp_dtype = torch.bfloat16 if (self.device_type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
 
-        # Mixed-precision scaler (only used with float16, not bfloat16)
-        # For bfloat16 we use autocast without a scaler since bf16 doesn't need
-        # loss scaling (it has the same exponent range as float32)
-        self.use_bf16 = config.use_amp and torch.cuda.is_bf16_supported()
-        self.use_fp16 = config.use_amp and not self.use_bf16
-        self.scaler = GradScaler(enabled=self.use_fp16)
-
-        # Training state
         self.global_step = 0
         self.best_eval_loss = float("inf")
-
         os.makedirs(config.output_dir, exist_ok=True)
 
-        # Log configuration
-        n_params = model.count_parameters()
-        logger.info(f"Model parameters: {n_params:,} ({n_params/1e6:.1f}M)")
-        logger.info(f"Device: {config.device}")
-        logger.info(f"Precision: {'bf16' if self.use_bf16 else 'fp16' if self.use_fp16 else 'fp32'}")
-        logger.info(f"Effective batch size: {config.batch_size * config.gradient_accumulation_steps}")
+        logger.info(f"CARD Trainer | {model.count_parameters():,} params")
+        logger.info(f"  Device: {config.device} | AMP: {self.use_amp} ({self.amp_dtype})")
+        logger.info(f"  Tail factor λ={config.tail_factor}, β={config.reweight_beta}, "
+                     f"decay p={config.reweight_decay}")
 
-    def _build_scheduler(self) -> torch.optim.lr_scheduler.LambdaLR:
-        """
-        Cosine LR schedule with linear warmup.
-
-        - Linearly increase from 0 to peak_lr over warmup_steps
-        - Cosine decay from peak_lr to 0 over remaining steps
-
-        This matches the "Cosine w/ Warmup" specification in Table 6.
-        """
+    def _build_cosine_schedule(self):
+        """Cosine annealing with linear warmup (Table 6)."""
         cfg = self.config
-
-        def lr_lambda(step: int) -> float:
+        def lr_lambda(step):
             if step < cfg.warmup_steps:
-                # Linear warmup: 0 → 1 over warmup_steps
                 return step / max(1, cfg.warmup_steps)
-            else:
-                # Cosine decay: 1 → 0 over remaining steps
-                progress = (step - cfg.warmup_steps) / max(
-                    1, cfg.max_steps - cfg.warmup_steps
-                )
-                return 0.5 * (1.0 + math.cos(math.pi * progress))
-
+            progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     # =========================================================================
-    # SOFT TAIL MASKING (Section 3.2, Algorithm 1 lines 6-11)
-    # =========================================================================
-
-    def soft_tail_masking(self, x0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Apply soft tail masking to a batch of clean sequences.
-
-        Standard MDLM masks tokens UNIFORMLY across all positions. This is
-        disastrous under causal attention because early positions have no
-        future context to fall back on — masking position 2 forces the model
-        to predict from essentially nothing.
-
-        CARD's solution: concentrate masks at the TAIL of the sequence.
-        The prefix stays clean, providing solid signal for the model.
-
-        The "soft" part: the masking window is WIDER than the number of masks
-        (controlled by tail_factor λ). This means within the tail region,
-        you get a MIX of clean and masked tokens, preserving local context.
-
-        Visual comparison for a 10-token sequence at t=0.3 (3 masks):
-            Uniform:    [clean] [MASK] [clean] [clean] [MASK] [clean] [clean] [MASK] [clean] [clean]
-            Strict tail: [clean] [clean] [clean] [clean] [clean] [clean] [clean] [MASK] [MASK] [MASK]
-            Soft tail:   [clean] [clean] [clean] [clean] [clean] [clean] [MASK] [clean] [MASK] [MASK]
-                                                                         ^--- window extends here
-
-        The paper proves (Proposition 2, Appendix A) that soft tail masking
-        preserves higher mutual information than uniform masking.
-
-        Args:
-            x0: (B, L) clean token ids
-            t:  (B,)   noise levels in [0, 1]
-        Returns:
-            x_t: (B, L) corrupted sequences with tail-biased masking
-        """
-        B, L = x0.shape
-        device = x0.device
-        mask_id = self.model.mask_token_id
-        lam = self.config.tail_factor
-
-        x_t = x0.clone()
-
-        # Vectorized implementation for the batch
-        for b in range(B):
-            t_val = t[b].item()
-
-            # Number of tokens to mask: N = floor(L * t)
-            N = max(1, int(L * t_val))
-
-            # Window size: W = floor(N * λ), clamped to sequence length
-            # λ > 1 means the window is wider than the mask count
-            # λ = 1 would be strict tail masking (solid block of noise)
-            W = min(L, int(N * lam))
-
-            # The window covers the last W positions
-            # We randomly select N positions WITHIN this window to mask
-            window_start = L - W
-
-            # Random permutation within the window → take first N indices
-            perm = torch.randperm(W, device=device)[:N]
-            mask_indices = perm + window_start
-
-            x_t[b, mask_indices] = mask_id
-
-        return x_t
-
-    # =========================================================================
-    # CONTEXT-AWARE REWEIGHTING (Section 3.3, Algorithm 1 lines 13-17)
-    # =========================================================================
-
-    def compute_context_aware_weights(self, x_t: torch.Tensor) -> torch.Tensor:
-        """
-        Compute per-token loss weights based on context ambiguity.
-
-        In standard ARM training, every position sees a clean prefix, so
-        uniform weighting is fine. In CARD, each position sees a CORRUPTED
-        prefix with varying amounts of noise. Predicting from heavy noise
-        produces high-variance gradients that destabilize training.
-
-        This function computes a "local ambiguity score" S^local_n for each
-        position based on three factors (Eq. 6-7):
-
-        1. QUANTITY: How many masks are in the context?
-           → More masks = higher score = lower weight
-
-        2. DISTANCE: How close are the masks to the current position?
-           → Nearby masks hurt more (exponential decay with distance)
-           → Follows the finding that LM context relevance decays
-             exponentially (Khandelwal et al., 2018)
-
-        3. DENSITY: Are masks consecutive?
-           → Consecutive masks (spans) are worse than isolated masks
-           → They completely sever local dependencies
-           → Cost C_i = 1 for isolated mask, 2 for consecutive mask
-
-        These combine into:
-            C_i = 𝟙[x_i is MASK] · (1 + 𝟙[x_{i-1} is MASK])
-            S^local_n = Σ_{i<n} C_i · (1-p)^{n-i}
-            w_n = 1 / (β + S^local_n)
-
-        The paper proves (Proposition 1) this is an inverse-variance
-        weighting that minimizes gradient variance.
-
-        Args:
-            x_t: (B, L) corrupted token ids
-        Returns:
-            weights: (B, L) per-token loss weights, higher = more trustworthy
-        """
-        B, L = x_t.shape
-        device = x_t.device
-        beta = self.config.reweight_beta
-        decay = self.config.reweight_decay
-
-        is_mask = (x_t == self.model.mask_token_id).float()  # (B, L)
-
-        # Density term: C_i = is_mask[i] * (1 + is_mask[i-1])
-        # Consecutive masks → cost 2; isolated mask → cost 1; clean → cost 0
-        prev_mask = F.pad(is_mask[:, :-1], (1, 0), value=0.0)
-        C = is_mask * (1.0 + prev_mask)  # (B, L)
-
-        # Compute S^local via the recurrence: S_n = C_n + (1-p) * S_{n-1}
-        # This is an exponentially-decayed cumulative sum (causal EMA)
-        retain = 1.0 - decay
-        S_local = torch.zeros(B, L, device=device)
-        running = torch.zeros(B, device=device)
-        for n in range(L):
-            running = C[:, n] + retain * running
-            S_local[:, n] = running
-
-        # Inverse weighting: ambiguous contexts get low weight
-        weights = 1.0 / (beta + S_local)
-
-        return weights
-
-    # =========================================================================
-    # SINGLE TRAINING STEP
+    # Training Step — Algorithm 1
     # =========================================================================
 
     def training_step(self, batch: torch.Tensor) -> float:
         """
-        Execute one CARD training step (Algorithm 1).
+        One CARD training step implementing Algorithm 1.
 
-        The complete procedure:
-          1. Sample t ~ U[0,1] per sequence in the batch
-          2. Corrupt via soft tail masking: x0 → x_t
-          3. Shift for next-token prediction: input = x_t[:-1], target = x0[1:]
-          4. Forward pass through causal transformer (same cost as ARM)
-          5. Compute context-aware weights for the input
-          6. Weighted cross-entropy loss
-          7. Backprop
+        Steps:
+          1. Sample t ~ U[0,1] per sequence               (line 4)
+          2. Apply soft tail masking: x0 → x_t             (lines 6-11)
+          3. Shift for next-token prediction               (standard GPT)
+          4. Forward pass (same cost as AR)                (line 19)
+          5. Compute context-aware weights                 (lines 13-17)
+          6. Weighted cross-entropy, all positions         (line 19)
+          7. Backprop                                      (line 20)
 
-        At t=0 (no noise): this is EXACTLY autoregressive training.
-        At t=1 (all noise): the model must generate from pure masks.
-        By sampling t uniformly, the model learns the full spectrum.
-
-        Args:
-            batch: (B, L) clean token sequences
-        Returns:
-            loss value (float, detached)
+        CRITICAL: the loss is computed at ALL positions (100% token utilization,
+        Section 3.1), not just masked ones. This is what gives CARD the same
+        data efficiency as ARM. Clean-context positions get high weight
+        (strong signal), noisy-context positions get low weight (weak signal).
         """
         cfg = self.config
-        x0 = batch.to(cfg.device)
+        x0 = batch.to(cfg.device)  # (B, L) clean tokens
         B, L = x0.shape
 
-        # Step 1: Sample noise level for each sequence
-        # Linear schedule σ(t) = t as stated in Section 2.3
+        # Step 1: sample noise level per sequence
         t = torch.rand(B, device=cfg.device)
 
-        # Step 2: Corrupt input via soft tail masking
-        x_t = self.soft_tail_masking(x0, t)
+        # Step 2: corrupt via soft tail masking
+        x_t = soft_tail_masking(x0, t, self.mask_token_id, cfg.tail_factor)
 
-        # Step 3: Shifted causal setup (standard GPT-style)
-        # The model at position n sees x^t_{≤n} and predicts x_{n+1}
-        input_ids = x_t[:, :-1]   # (B, L-1) — corrupted context
-        targets = x0[:, 1:]       # (B, L-1) — clean next tokens
+        # Step 3: shifted causal setup (standard GPT next-token prediction)
+        # Position n in input → predict position n+1 in targets
+        input_ids = x_t[:, :-1]   # (B, L-1) corrupted prefix
+        targets   = x0[:, 1:]     # (B, L-1) CLEAN next tokens
 
-        # Step 4: Forward pass with mixed precision
-        amp_dtype = torch.bfloat16 if self.use_bf16 else torch.float16
-        with autocast(device_type="cuda", dtype=amp_dtype, enabled=cfg.use_amp):
-            logits = self.model(input_ids, t)  # (B, L-1, V)
+        # Steps 4-6 under mixed precision
+        with torch.autocast(device_type=self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
+            logits, _ = self.model(input_ids)  # (B, L-1, V)
 
-            # Step 5: Context-aware weights
-            weights = self.compute_context_aware_weights(input_ids)  # (B, L-1)
+            # Step 5: context-aware weights on the input (the corrupted context)
+            weights = compute_context_aware_weights(
+                input_ids, self.mask_token_id, cfg.reweight_beta, cfg.reweight_decay
+            )  # (B, L-1)
 
-            # Step 6: Weighted cross-entropy
-            ce_loss = F.cross_entropy(
-                logits.reshape(-1, self.model.vocab_size),
+            # Step 6: weighted cross-entropy over ALL positions
+            ce = F.cross_entropy(
+                logits.reshape(-1, self.model.config.vocab_size),
                 targets.reshape(-1),
                 reduction="none",
             ).reshape(B, -1)  # (B, L-1)
 
-            loss = (weights * ce_loss).sum() / weights.sum()
-
-            # Scale for gradient accumulation
+            loss = (weights * ce).sum() / weights.sum()
             loss = loss / cfg.gradient_accumulation_steps
 
-        # Step 7: Backward pass
-        if self.use_fp16:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
+        loss.backward()
         return loss.item() * cfg.gradient_accumulation_steps
 
     # =========================================================================
-    # EVALUATION
+    # Evaluation
     # =========================================================================
 
     @torch.no_grad()
-    def evaluate(self) -> float:
+    def evaluate(self) -> tuple:
         """
-        Compute average loss on the eval set.
+        Evaluate at t=0 (clean input) → standard AR perplexity.
+        This gives a clean comparison with the AR baseline.
 
-        Uses t=0 (no noise) for evaluation, which makes this equivalent
-        to standard autoregressive perplexity. This gives a clean comparison
-        with ARM baselines.
+        Returns:
+            (loss, accuracy, tokens_per_sec): average loss per token, accuracy, and throughput
         """
         if self.eval_loader is None:
-            return float("nan")
+            return float("nan"), float("nan"), float("nan")
 
         self.model.eval()
-        total_loss = 0.0
-        total_tokens = 0
+        total_loss, total_tokens, correct_tokens = 0.0, 0, 0
+        start_time = time.time()
 
         for batch in self.eval_loader:
             x0 = batch.to(self.config.device)
-            B, L = x0.shape
+            input_ids, targets = x0[:, :-1], x0[:, 1:]
 
-            input_ids = x0[:, :-1]
-            targets = x0[:, 1:]
+            with torch.autocast(device_type=self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
+                logits, _ = self.model(input_ids)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, self.model.config.vocab_size),
+                    targets.reshape(-1),
+                    reduction="sum",
+                )
 
-            # Evaluate with t=0 (clean input, standard AR evaluation)
-            t = torch.zeros(B, device=self.config.device)
-            logits = self.model(input_ids, t)
-
-            loss = F.cross_entropy(
-                logits.reshape(-1, self.model.vocab_size),
-                targets.reshape(-1),
-                reduction="sum",
-            )
+                # Compute accuracy
+                predictions = logits.argmax(dim=-1)
+                correct_tokens += (predictions == targets).sum().item()
 
             total_loss += loss.item()
             total_tokens += targets.numel()
 
+        elapsed_time = time.time() - start_time
         self.model.train()
         avg_loss = total_loss / max(total_tokens, 1)
-        return avg_loss
+        accuracy = correct_tokens / max(total_tokens, 1)
+        tokens_per_sec = total_tokens / max(elapsed_time, 1e-6)
+        return avg_loss, accuracy, tokens_per_sec
 
     # =========================================================================
-    # CHECKPOINTING
+    # Checkpointing
     # =========================================================================
 
     def save_checkpoint(self, path: Optional[str] = None):
-        """Save model, optimizer, scheduler state and training progress."""
-        if path is None:
-            path = os.path.join(
-                self.config.output_dir, f"checkpoint_step_{self.global_step}.pt"
-            )
-
-        checkpoint = {
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "global_step": self.global_step,
+        path = path or os.path.join(self.config.output_dir, f"card_step_{self.global_step}.pt")
+        torch.save({
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "step": self.global_step,
             "best_eval_loss": self.best_eval_loss,
-            "config": self.config,
-        }
-        torch.save(checkpoint, path)
-        logger.info(f"Saved checkpoint to {path}")
+            "model_config": self.model.config,
+        }, path)
+        logger.info(f"Saved checkpoint: {path}")
 
     def load_checkpoint(self, path: str):
-        """Resume training from a checkpoint."""
-        checkpoint = torch.load(path, map_location=self.config.device)
-
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        self.global_step = checkpoint["global_step"]
-        self.best_eval_loss = checkpoint.get("best_eval_loss", float("inf"))
-
-        logger.info(f"Resumed from {path} at step {self.global_step}")
+        ckpt = torch.load(path, map_location=self.config.device, weights_only=False)
+        self.model.load_state_dict(ckpt["model"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.scheduler.load_state_dict(ckpt["scheduler"])
+        self.global_step = ckpt["step"]
+        self.best_eval_loss = ckpt.get("best_eval_loss", float("inf"))
+        logger.info(f"Resumed from step {self.global_step}")
 
     # =========================================================================
-    # MAIN TRAINING LOOP
+    # Main loop
     # =========================================================================
 
     def train(self):
-        """
-        Main training loop.
-
-        Iterates over the training data, calling training_step() for each batch,
-        with gradient accumulation, LR scheduling, periodic evaluation, and
-        checkpointing.
-
-        The loop structure is standard PyTorch training — the CARD-specific
-        logic (masking, reweighting) is all inside training_step().
-        """
         cfg = self.config
         self.model.train()
-
         train_iter = iter(self.train_loader)
         accum_loss = 0.0
-        start_time = time.time()
-        tokens_processed = 0
+        t0 = time.time()
+        tokens = 0
 
-        logger.info(f"Starting training from step {self.global_step}")
-        logger.info(f"Total steps: {cfg.max_steps}")
+        logger.info(f"CARD training: steps {self.global_step} → {cfg.max_steps}")
 
         while self.global_step < cfg.max_steps:
-            # --- Gradient accumulation loop ---
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
-            for micro_step in range(cfg.gradient_accumulation_steps):
-                # Get next batch, cycling through the dataset
+            for _ in range(cfg.gradient_accumulation_steps):
                 try:
                     batch = next(train_iter)
                 except StopIteration:
                     train_iter = iter(self.train_loader)
                     batch = next(train_iter)
 
-                loss = self.training_step(batch)
-                accum_loss += loss
+                step_loss = self.training_step(batch)
+                accum_loss += step_loss
+                tokens += batch.numel()
 
-                tokens_processed += batch.numel()
-
-            # --- Gradient clipping + optimizer step ---
-            if self.use_fp16:
-                self.scaler.unscale_(self.optimizer)
-
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), cfg.max_grad_norm
-            )
-
-            if self.use_fp16:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-
+            # Gradient clipping + optimizer step
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
+            self.optimizer.step()
             self.scheduler.step()
             self.global_step += 1
 
-            # --- Logging ---
+            # Logging
             if self.global_step % cfg.log_interval == 0:
-                elapsed = time.time() - start_time
-                tokens_per_sec = tokens_processed / elapsed
-                current_lr = self.scheduler.get_last_lr()[0]
-                avg_loss = accum_loss / cfg.log_interval
-
+                elapsed = time.time() - t0
+                avg = accum_loss / cfg.log_interval
+                lr = self.scheduler.get_last_lr()[0]
+                tps = tokens / elapsed
                 logger.info(
-                    f"Step {self.global_step:>7d} | "
-                    f"Loss: {avg_loss:.4f} | "
-                    f"LR: {current_lr:.2e} | "
-                    f"Tok/s: {tokens_per_sec:.0f} | "
-                    f"Elapsed: {elapsed:.0f}s"
+                    f"[CARD] step {self.global_step:>7d} | loss {avg:.4f} | "
+                    f"lr {lr:.2e} | {tps:.0f} tok/s"
                 )
+
+                # Log to Neptune
+                if self.neptune_run is not None:
+                    try:
+                        self.neptune_run["train/loss"].append(avg, step=self.global_step)
+                        self.neptune_run["train/learning_rate"].append(lr, step=self.global_step)
+                        self.neptune_run["train/tokens_per_sec"].append(tps, step=self.global_step)
+                    except Exception as e:
+                        logger.warning(f"Failed to log to Neptune: {e}")
 
                 accum_loss = 0.0
 
-            # --- Evaluation ---
+            # Eval
             if self.global_step % cfg.eval_interval == 0:
-                eval_loss = self.evaluate()
-                eval_ppl = math.exp(min(eval_loss, 20))  # Clamp to avoid overflow
+                val_loss, val_acc, val_tps = self.evaluate()
+                val_ppl = math.exp(min(val_loss, 20))
+                logger.info(f"  eval loss={val_loss:.4f} ppl={val_ppl:.2f} acc={val_acc:.4f} | {val_tps:.0f} tok/s")
 
-                logger.info(
-                    f"  Eval @ step {self.global_step}: "
-                    f"Loss = {eval_loss:.4f}, PPL = {eval_ppl:.2f}"
-                )
+                # Log to Neptune
+                if self.neptune_run is not None:
+                    try:
+                        self.neptune_run["val/loss"].append(val_loss, step=self.global_step)
+                        self.neptune_run["val/ppl"].append(val_ppl, step=self.global_step)
+                        self.neptune_run["val/acc"].append(val_acc, step=self.global_step)
+                        self.neptune_run["val/tokens_per_sec"].append(val_tps, step=self.global_step)
+                    except Exception as e:
+                        logger.warning(f"Failed to log eval metrics to Neptune: {e}")
 
-                # Save best model
-                if eval_loss < self.best_eval_loss:
-                    self.best_eval_loss = eval_loss
-                    best_path = os.path.join(cfg.output_dir, "best_model.pt")
-                    self.save_checkpoint(best_path)
-                    logger.info(f"  New best model (loss={eval_loss:.4f})")
+                if val_loss < self.best_eval_loss:
+                    self.best_eval_loss = val_loss
+                    self.save_checkpoint(
+                        os.path.join(cfg.output_dir, "card_best.pt")
+                    )
 
-            # --- Periodic checkpointing ---
+            # Periodic save
             if self.global_step % cfg.save_interval == 0:
                 self.save_checkpoint()
 
-        # Final checkpoint
         self.save_checkpoint()
-        logger.info(f"Training complete after {self.global_step} steps")
+        logger.info("CARD training complete.")

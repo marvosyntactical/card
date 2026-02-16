@@ -1,6 +1,6 @@
 """
-model.py — Causal Transformer Language Model (shared by CARD, AR, and DREAM)
-==============================================================================
+model.py — Causal Transformer Language Model (shared by CARD and AR)
+====================================================================
 
 CRITICAL DESIGN NOTE:
     CARD does NOT modify the transformer architecture. There is no timestep
@@ -12,11 +12,6 @@ CRITICAL DESIGN NOTE:
 
     Therefore, CARD and AR use THE EXACT SAME MODEL. The only difference
     is the training procedure (soft tail masking + context-aware reweighting).
-
-    DREAM (Diffusion-Refined Embedding-space Autoregressive Model) extends
-    the model with a continuous thought mode: instead of projecting to logits,
-    the final hidden state is forwarded as the next input embedding. This
-    enables "thinking" in embedding space before committing to a token.
 
 Architecture (Table 6):
     - Pre-norm causal transformer (GPT-style)
@@ -55,15 +50,6 @@ class ModelConfig:
     # The last token in the vocabulary is reserved for [MASK].
     # AR training never uses it; CARD training masks tokens with it.
     # Keeping it in both models ensures identical architectures for fair comparison.
-
-    # DREAM (CoCoNut) configuration
-    dream_enabled: bool = False
-    dream_max_thoughts: int = 4    # max continuous thought steps per position
-    # NOTE: dream_projection could be 'none' (direct hidden→embed), 'linear'
-    # (learned d_model→d_model), or 'mlp'. We default to 'linear' for a small
-    # overhead that helps bridge the representation gap between final-layer
-    # hidden states and the input embedding space.
-    dream_projection: str = "linear"  # 'none', 'linear', 'mlp'
 
     @property
     def head_dim(self) -> int:
@@ -131,11 +117,6 @@ class KVCache:
         """Return current cached KV without modification."""
         return self.k[:, :, :self.seq_len], self.v[:, :, :self.seq_len]
 
-    def truncate(self, length: int):
-        """Truncate cache back to given length (useful for rollback)."""
-        assert length <= self.seq_len
-        self.seq_len = length
-
     def clone(self) -> "KVCache":
         """Create a deep copy (useful for CARD: snapshot prefix before denoising)."""
         new = KVCache.__new__(KVCache)
@@ -163,22 +144,39 @@ class RotaryEmbedding(nn.Module):
     Rotary Position Embedding (Su et al., 2021).
 
     Encodes position information by rotating pairs of dimensions in Q and K.
+    Advantages over absolute position embeddings for KV caching:
+      - Cached K vectors already have their rotations baked in, no recomputation
+      - Position is determined by the rotation applied at encoding time
+      - Better length generalization than learned absolute embeddings
     """
 
     def __init__(self, head_dim: int, max_len: int = 8192, base: float = 10000.0):
         super().__init__()
+        # Precompute the frequency bands: θ_i = base^{-2i/d}
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Precompute cos/sin tables for all positions up to max_len
         self._build_cache(max_len)
 
     def _build_cache(self, max_len: int):
         t = torch.arange(max_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
+        freqs = torch.outer(t, self.inv_freq)  # (max_len, head_dim/2)
+        # Duplicate for paired dimensions: [θ0, θ1, ..., θ0, θ1, ...]
+        emb = torch.cat([freqs, freqs], dim=-1)  # (max_len, head_dim)
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        """
+        Apply rotary embedding to input tensor.
+
+        Args:
+            x: (B, H, L, head_dim) query or key tensor
+            offset: position offset (= length of KV cache for generation)
+        Returns:
+            Rotated tensor of the same shape.
+        """
         seq_len = x.size(2)
         cos = self.cos_cached[offset : offset + seq_len].unsqueeze(0).unsqueeze(0)
         sin = self.sin_cached[offset : offset + seq_len].unsqueeze(0).unsqueeze(0)
@@ -186,6 +184,7 @@ class RotaryEmbedding(nn.Module):
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """Rotate pairs of dimensions: [x0, x1, x2, x3, ...] → [-x_{d/2}, ..., x0, ...]"""
         d = x.size(-1)
         x1, x2 = x[..., : d // 2], x[..., d // 2 :]
         return torch.cat([-x2, x1], dim=-1)
@@ -198,13 +197,22 @@ class RotaryEmbedding(nn.Module):
 class CausalSelfAttention(nn.Module):
     """
     Multi-head causal self-attention with RoPE and KV caching.
-    Uses F.scaled_dot_product_attention (Flash Attention 2 when available).
+
+    Uses F.scaled_dot_product_attention which dispatches to:
+      - Flash Attention 2 (when available, CUDA)
+      - Memory-efficient attention (fallback)
+      - Math attention (CPU)
+
+    For KV caching: is_causal=True with different Q/K lengths creates the
+    correct mask where Q[i] attends to K[j] for j <= i + past_len.
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.n_heads = config.n_heads
         self.head_dim = config.head_dim
+
+        # Fused QKV projection — single matmul is faster than three separate ones
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.rotary = RotaryEmbedding(config.head_dim, config.max_len)
@@ -216,30 +224,54 @@ class CausalSelfAttention(nn.Module):
         pos_offset: int = 0,
         kv_cache: Optional[KVCache] = None,
     ) -> tuple:
+        """
+        Args:
+            x:          (B, L, D) hidden states for current tokens
+            pos_offset: absolute position of the first token in x
+            kv_cache:   optional KVCache to use/update
+        Returns:
+            output:  (B, L, D) attention output
+            kv_cache: updated KVCache (or None if no cache provided)
+        """
         B, L, D = x.shape
+
+        # Compute Q, K, V for current tokens
         qkv = self.qkv_proj(x).reshape(B, L, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
+        q, k, v = qkv.unbind(dim=2)  # each: (B, L, H, head_dim)
+        q = q.transpose(1, 2)  # (B, H, L, head_dim)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # Apply RoPE to Q and K (position-aware rotation)
         q = self.rotary(q, offset=pos_offset)
         k = self.rotary(k, offset=pos_offset)
 
+        # KV caching: prepend past keys/values
         if kv_cache is not None:
             k, v = kv_cache.update(k, v)
+            # k, v now have shape (B, H, past_len + L, head_dim)
 
+        # Scaled dot-product attention with causal mask
+        # When Q.size(2) != K.size(2), is_causal=True correctly masks such that
+        # Q[i] attends to K[j] for j <= i + (K_len - Q_len), i.e. j <= i + past_len
         dropout_p = self.attn_dropout if self.training else 0.0
         attn_out = F.scaled_dot_product_attention(
             q, k, v, is_causal=True, dropout_p=dropout_p
         )
 
+        # Reshape and project
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         return self.out_proj(attn_out), kv_cache
 
 
 class FeedForward(nn.Module):
-    """Position-wise FFN with SiLU activation (Table 6)."""
+    """
+    Position-wise feedforward with SiLU activation (Table 6).
+
+    Standard 2-layer FFN: up_proj → SiLU → down_proj.
+    The paper specifies "Activation Function: SiLU" and
+    "Intermediate Size: 4096", indicating a standard (non-gated) FFN.
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -251,7 +283,12 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block: LN → Attn → residual → LN → FFN → residual."""
+    """
+    Pre-norm transformer block: LN → Attention → residual → LN → FFN → residual.
+
+    Pre-norm (as opposed to post-norm) is standard in modern LLMs and
+    provides more stable training dynamics.
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -261,50 +298,18 @@ class TransformerBlock(nn.Module):
         self.ff = FeedForward(config)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, pos_offset=0, kv_cache=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        pos_offset: int = 0,
+        kv_cache: Optional[KVCache] = None,
+    ) -> tuple:
+        # Attention with pre-norm and residual
         h, kv_cache = self.attn(self.norm1(x), pos_offset, kv_cache)
         x = x + self.dropout(h)
+        # FFN with pre-norm and residual
         x = x + self.dropout(self.ff(self.norm2(x)))
         return x, kv_cache
-
-
-# =============================================================================
-# DREAM Projection Module
-# =============================================================================
-
-class DREAMProjection(nn.Module):
-    """
-    Projects final-layer hidden states back into the input embedding space
-    for continuous thought forwarding (CoCoNut-style).
-
-    The gap between the output hidden space (post final_norm, pre lm_head)
-    and the input embedding space is non-trivial — a learned projection
-    helps bridge this.
-
-    NOTE: Alternative approaches:
-      - 'none':   direct pass-through (h → embed), simplest but may underperform
-      - 'linear': single linear layer (default, small overhead)
-      - 'mlp':    two-layer MLP with SiLU, more expressive but heavier
-    """
-
-    def __init__(self, d_model: int, projection_type: str = "linear"):
-        super().__init__()
-        self.projection_type = projection_type
-        if projection_type == "linear":
-            self.proj = nn.Linear(d_model, d_model, bias=False)
-        elif projection_type == "mlp":
-            self.proj = nn.Sequential(
-                nn.Linear(d_model, d_model * 2, bias=False),
-                nn.SiLU(),
-                nn.Linear(d_model * 2, d_model, bias=False),
-            )
-        elif projection_type == "none":
-            self.proj = nn.Identity()
-        else:
-            raise ValueError(f"Unknown DREAM projection type: {projection_type}")
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.proj(h)
 
 
 # =============================================================================
@@ -313,19 +318,25 @@ class DREAMProjection(nn.Module):
 
 class CausalLM(nn.Module):
     """
-    Causal Language Model shared by CARD, AR, and DREAM training.
+    Causal Language Model shared by both CARD and AR training.
 
-    This is a standard GPT-style model. CARD/AR use identical architecture;
-    DREAM adds only a small projection module for continuous thought.
+    This is a standard GPT-style model. There is NOTHING diffusion-specific
+    in the architecture. CARD's Eq. 5 conditions only on x^t_{<n}, with no
+    explicit timestep — the model infers noise level from the [MASK] pattern.
+
+    The ONLY vocabulary difference: the last token (vocab_size - 1) is reserved
+    for [MASK]. AR training never produces this token; CARD training injects it.
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
 
+        # Token embedding (no absolute position embedding — we use RoPE)
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
         self.emb_dropout = nn.Dropout(config.dropout)
 
+        # Transformer blocks
         self.blocks = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.n_layers)
         ])
@@ -335,14 +346,9 @@ class CausalLM(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
 
-        # DREAM: continuous thought projection
-        if config.dream_enabled:
-            self.dream_proj = DREAMProjection(config.d_model, config.dream_projection)
-        else:
-            self.dream_proj = None
-
         # Initialize weights
         self.apply(self._init_weights)
+        # Scale residual projections by 1/√(2*n_layers) for stable deep training
         for block in self.blocks:
             nn.init.normal_(block.attn.out_proj.weight, std=0.02 / math.sqrt(2 * config.n_layers))
             nn.init.normal_(block.ff.down_proj.weight, std=0.02 / math.sqrt(2 * config.n_layers))
@@ -357,31 +363,23 @@ class CausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor,
         pos_offset: int = 0,
         kv_caches: Optional[list] = None,
-        return_hidden: bool = False,
-        input_embeds: Optional[torch.Tensor] = None,
     ) -> tuple:
         """
         Forward pass through the causal transformer.
 
         Args:
-            input_ids: (B, L) token ids (ignored if input_embeds is provided)
+            input_ids: (B, L) token ids
             pos_offset: starting position for RoPE (= cache length for generation)
             kv_caches: optional list of KVCache objects (one per layer)
-            return_hidden: if True, also return final hidden states (for DREAM)
-            input_embeds: (B, L, D) optional pre-computed embeddings (for DREAM
-                          continuous thought steps — bypasses tok_emb lookup)
         Returns:
             logits: (B, L, vocab_size)
             kv_caches: list of updated KVCache objects (or None)
-            [hidden]: (B, L, D) final hidden states (only if return_hidden=True)
         """
-        if input_embeds is not None:
-            h = self.emb_dropout(input_embeds)
-        else:
-            h = self.emb_dropout(self.tok_emb(input_ids))
+        B, L = input_ids.shape
+        h = self.emb_dropout(self.tok_emb(input_ids))
 
         new_caches = []
         for i, block in enumerate(self.blocks):
@@ -389,25 +387,9 @@ class CausalLM(nn.Module):
             h, cache_i = block(h, pos_offset, cache_i)
             new_caches.append(cache_i)
 
-        h = self.final_norm(h)
-        logits = self.lm_head(h)
+        logits = self.lm_head(self.final_norm(h))
         out_caches = new_caches if kv_caches is not None else None
-
-        if return_hidden:
-            return logits, out_caches, h
         return logits, out_caches
-
-    def dream_forward_thought(self, hidden: torch.Tensor) -> torch.Tensor:
-        """
-        Project final hidden states back to embedding space for continuous thought.
-
-        Args:
-            hidden: (B, L, D) final-layer hidden states from forward()
-        Returns:
-            thought_embed: (B, L, D) embeddings suitable as input_embeds
-        """
-        assert self.dream_proj is not None, "DREAM not enabled in config"
-        return self.dream_proj(hidden)
 
     # =========================================================================
     # Generation utilities
@@ -431,15 +413,30 @@ class CausalLM(nn.Module):
         temperature: float = 1.0,
         top_k: int = 50,
     ) -> torch.Tensor:
-        """Standard autoregressive generation with KV caching."""
+        """
+        Standard autoregressive generation with KV caching.
+
+        Each step: one forward pass over ONE token → one new token.
+        Total forward passes = max_new_tokens.
+
+        Args:
+            prompt_ids: (1, P) prompt token ids
+            max_new_tokens: number of tokens to generate
+            temperature: sampling temperature
+            top_k: top-k filtering (0 = no filtering)
+        Returns:
+            (1, P + max_new_tokens) full sequence
+        """
         self.eval()
         device = prompt_ids.device
         B = prompt_ids.size(0)
         dtype = next(self.parameters()).dtype
 
+        # Encode full prompt to build KV cache
         kv_caches = self.init_kv_caches(B, device, dtype)
         logits, kv_caches = self(prompt_ids, pos_offset=0, kv_caches=kv_caches)
 
+        # Sample first new token from last position
         next_token = self._sample(logits[:, -1:], temperature, top_k)
         generated = [prompt_ids, next_token]
         pos = prompt_ids.size(1)
@@ -461,26 +458,35 @@ class CausalLM(nn.Module):
         denoise_steps: int = 8,
         confidence_threshold: float = 0.9,
         temperature: float = 1.0,
-        decoding_strategy: str = "threshold",
     ) -> torch.Tensor:
         """
         CARD generation: confidence-based parallel decoding with KV caching.
         (Section 3.4, Eq. 9)
 
-        Supports multiple decoding strategies:
-          - 'threshold':   original paper method — unmask when max_prob > τ
-          - 'entropy':     unmask when entropy < threshold (information-theoretic)
-          - 'adaptive':    τ decays per step (easy tokens first)
-          - 'speculative': draft-then-verify (inspired by speculative decoding)
+        Each "block" of K tokens is decoded in denoise_steps iterations.
+        Effective speedup ≈ block_size / denoise_steps vs AR.
+
+        Procedure per block:
+          1. Snapshot the prefix KV cache
+          2. Create K [MASK] tokens
+          3. For each denoising step:
+             - Forward pass over K tokens (using prefix cache, NOT updating it)
+             - Unmask tokens where confidence > threshold
+          4. Force-decode remaining masks on the last step
+          5. Re-encode the finalized block to update the prefix cache
+
+        The prefix cache is read-only during denoising because unmasking
+        tokens changes the hidden states — cached KVs for partially-masked
+        input would be stale. After finalizing, one clean forward pass
+        updates the cache correctly.
 
         Args:
             prompt_ids: (1, P) prompt tokens
             max_new_tokens: total tokens to generate
             block_size: K — tokens per block
             denoise_steps: T_max — denoising iterations per block
-            confidence_threshold: τ — base threshold
+            confidence_threshold: τ — unmask when max_prob > τ
             temperature: sampling temperature
-            decoding_strategy: 'threshold', 'entropy', 'adaptive', 'speculative'
         Returns:
             (1, P + generated) full sequence
         """
@@ -490,201 +496,57 @@ class CausalLM(nn.Module):
         B = prompt_ids.size(0)
         dtype = next(self.parameters()).dtype
 
+        # Encode prompt to build initial KV cache
         kv_caches = self.init_kv_caches(B, device, dtype)
         _, kv_caches = self(prompt_ids, pos_offset=0, kv_caches=kv_caches)
 
         generated = [prompt_ids]
+        current_len = prompt_ids.size(1)
         tokens_generated = 0
 
         while tokens_generated < max_new_tokens:
             K = min(block_size, max_new_tokens - tokens_generated)
             block = torch.full((B, K), mask_id, device=device, dtype=torch.long)
+
+            # Snapshot prefix cache — denoising reads from this, doesn't modify it
             prefix_len = kv_caches[0].seq_len
 
-            if decoding_strategy == "speculative":
-                block = self._speculative_decode_block(
-                    block, kv_caches, prefix_len, denoise_steps,
-                    confidence_threshold, temperature, mask_id
-                )
-            else:
-                block = self._iterative_decode_block(
-                    block, kv_caches, prefix_len, denoise_steps,
-                    confidence_threshold, temperature, mask_id,
-                    strategy=decoding_strategy,
-                )
+            for step in range(denoise_steps):
+                is_masked = (block == mask_id)
+                if not is_masked.any():
+                    break
 
-            # Re-encode the clean block to update KV cache correctly
+                # Forward pass over just the block, using prefix cache as context
+                # We create temporary caches that extend the prefix but don't persist
+                temp_caches = [c.clone() for c in kv_caches]
+                logits, _ = self(block, pos_offset=prefix_len, kv_caches=temp_caches)
+
+                probs = (logits / temperature).softmax(dim=-1)
+                max_probs, predicted = probs.max(dim=-1)
+
+                # Unmask confident positions (Eq. 9)
+                confident = is_masked & (max_probs > confidence_threshold)
+                block[confident] = predicted[confident]
+
+                # Last step: force-decode ALL remaining masks
+                if step == denoise_steps - 1:
+                    still_masked = (block == mask_id)
+                    if still_masked.any():
+                        for b in range(B):
+                            mask_pos = still_masked[b].nonzero(as_tuple=True)[0]
+                            if mask_pos.numel() > 0:
+                                sampled = torch.multinomial(
+                                    probs[b, mask_pos], num_samples=1
+                                ).squeeze(-1)
+                                block[b, mask_pos] = sampled
+
+            # Finalize: re-encode the clean block to update KV cache correctly
+            # The prefix cache still has seq_len = prefix_len, so this appends
             _, kv_caches = self(block, pos_offset=prefix_len, kv_caches=kv_caches)
+
             generated.append(block)
             tokens_generated += K
-
-        return torch.cat(generated, dim=1)
-
-    def _iterative_decode_block(
-        self, block, kv_caches, prefix_len, denoise_steps,
-        confidence_threshold, temperature, mask_id, strategy="threshold",
-    ) -> torch.Tensor:
-        """
-        Iterative denoising of a [MASK] block.
-
-        Strategies:
-          'threshold': unmask if max_prob > τ (Eq. 9 from paper)
-          'entropy':   unmask if H(p) < τ (lower entropy = more certain)
-          'adaptive':  τ starts high and decays each step (easy tokens first)
-        """
-        B, K = block.shape
-
-        for step in range(denoise_steps):
-            is_masked = (block == mask_id)
-            if not is_masked.any():
-                break
-
-            temp_caches = [c.clone() for c in kv_caches]
-            logits, _ = self(block, pos_offset=prefix_len, kv_caches=temp_caches)
-            probs = (logits / temperature).softmax(dim=-1)
-            max_probs, predicted = probs.max(dim=-1)
-
-            if strategy == "threshold":
-                confident = is_masked & (max_probs > confidence_threshold)
-
-            elif strategy == "entropy":
-                # NOTE: confidence_threshold is interpreted as entropy threshold.
-                # Typical values: 1.0–3.0 (nats). Could normalize by log(V)
-                # for scale-invariance across vocab sizes.
-                log_probs = (probs + 1e-10).log()
-                entropy = -(probs * log_probs).sum(dim=-1)
-                confident = is_masked & (entropy < confidence_threshold)
-
-            elif strategy == "adaptive":
-                # Linear decay from confidence_threshold → 0.1
-                # NOTE: Cosine or exponential decay could work better;
-                # linear is simplest and matches the paper's spirit.
-                progress = step / max(denoise_steps - 1, 1)
-                tau = confidence_threshold * (1 - progress) + 0.1 * progress
-                confident = is_masked & (max_probs > tau)
-
-            else:
-                raise ValueError(f"Unknown decoding strategy: {strategy}")
-
-            block[confident] = predicted[confident]
-
-            # Last step: force-decode remaining masks
-            if step == denoise_steps - 1:
-                still_masked = (block == mask_id)
-                if still_masked.any():
-                    for b in range(B):
-                        mask_pos = still_masked[b].nonzero(as_tuple=True)[0]
-                        if mask_pos.numel() > 0:
-                            sampled = torch.multinomial(
-                                probs[b, mask_pos], num_samples=1
-                            ).squeeze(-1)
-                            block[b, mask_pos] = sampled
-
-        return block
-
-    def _speculative_decode_block(
-        self, block, kv_caches, prefix_len, denoise_steps,
-        confidence_threshold, temperature, mask_id,
-    ) -> torch.Tensor:
-        """
-        Speculative decoding for CARD blocks.
-
-        Draft the full block greedily, verify with a second pass,
-        re-mask rejected tokens, then do iterative denoising on the rest.
-
-        NOTE: A more sophisticated version would use a smaller draft model.
-        Here we use the same model for both, so speedup comes from reducing
-        denoising iterations rather than using a cheaper model.
-        """
-        B, K = block.shape
-
-        # Draft: greedy decode all masks
-        temp_caches = [c.clone() for c in kv_caches]
-        logits, _ = self(block, pos_offset=prefix_len, kv_caches=temp_caches)
-        probs = (logits / temperature).softmax(dim=-1)
-        _, draft_tokens = probs.max(dim=-1)
-        block = draft_tokens.clone()
-
-        # Verify: re-run with draft tokens
-        temp_caches = [c.clone() for c in kv_caches]
-        logits_v, _ = self(block, pos_offset=prefix_len, kv_caches=temp_caches)
-        probs_v = (logits_v / temperature).softmax(dim=-1)
-        max_probs_v, verified = probs_v.max(dim=-1)
-
-        # Reject where verify disagrees or confidence is low
-        rejected = (verified != block) | (max_probs_v < confidence_threshold)
-        block[rejected] = mask_id
-
-        # Denoise remaining masks
-        remaining_steps = max(1, denoise_steps - 2)
-        if (block == mask_id).any():
-            block = self._iterative_decode_block(
-                block, kv_caches, prefix_len, remaining_steps,
-                confidence_threshold, temperature, mask_id,
-                strategy="adaptive",
-            )
-        return block
-
-    @torch.no_grad()
-    def generate_dream(
-        self,
-        prompt_ids: torch.Tensor,
-        max_new_tokens: int = 256,
-        thought_steps: int = 3,
-        temperature: float = 1.0,
-        top_k: int = 50,
-    ) -> torch.Tensor:
-        """
-        DREAM generation: think in continuous embedding space before committing.
-
-        For each output token:
-          1. Run forward pass → get hidden state h
-          2. For thought_steps iterations: project h → embed → forward → h
-          3. Project final h to logits and sample
-
-        NOTE: Each thought step consumes one KV cache position. This shrinks
-        the effective context window. An alternative is to NOT cache thoughts
-        (saves positions but loses ability to attend to intermediate reasoning).
-        We cache by default since the original CoCoNut paper showed benefit.
-        """
-        assert self.dream_proj is not None, "DREAM not enabled in config"
-        self.eval()
-        device = prompt_ids.device
-        B = prompt_ids.size(0)
-        dtype = next(self.parameters()).dtype
-
-        kv_caches = self.init_kv_caches(B, device, dtype)
-        logits, kv_caches, hidden = self(
-            prompt_ids, pos_offset=0, kv_caches=kv_caches, return_hidden=True
-        )
-
-        h = hidden[:, -1:, :]
-        pos = prompt_ids.size(1)
-        generated = [prompt_ids]
-
-        for _ in range(max_new_tokens):
-            # Continuous thought steps
-            for _ in range(thought_steps):
-                thought_embed = self.dream_forward_thought(h)
-                logits, kv_caches, h = self(
-                    input_embeds=thought_embed,
-                    pos_offset=pos,
-                    kv_caches=kv_caches,
-                    return_hidden=True,
-                )
-                h = h[:, -1:, :]
-                pos += 1
-
-            # Commit: sample a discrete token
-            next_token = self._sample(logits[:, -1:], temperature, top_k)
-            generated.append(next_token)
-
-            # Re-enter discrete space
-            logits, kv_caches, hidden = self(
-                next_token, pos_offset=pos, kv_caches=kv_caches, return_hidden=True
-            )
-            h = hidden[:, -1:, :]
-            pos += 1
+            current_len += K
 
         return torch.cat(generated, dim=1)
 

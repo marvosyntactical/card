@@ -8,6 +8,10 @@ only the training objective differs.
 
 AR training:  L = Σ_n log p(x_n | x_{<n})         — clean prefix, no noise
 CARD training: L = Σ_n w_n · log p(x_n | x^t_{<n}) — noisy prefix, weighted
+
+The paper reports that on 300B tokens (Table 1):
+  ARM:  56.39% average accuracy
+  CARD: 53.23% average accuracy (but lower PPL on 6/8 domains, Table 2)
 """
 
 import os
@@ -49,7 +53,7 @@ class ARTrainer:
     """
     Standard autoregressive LM trainer.
 
-    Vanilla GPT training:
+    Nothing fancy — this is vanilla GPT training:
       input:  x_0, x_1, ..., x_{L-2}
       target: x_1, x_2, ..., x_{L-1}
       loss:   cross-entropy, uniform weight
@@ -79,6 +83,7 @@ class ARTrainer:
         )
 
         self.scheduler = self._build_cosine_schedule()
+        # Determine device type for autocast (cuda or cpu)
         self.device_type = "cuda" if config.device.startswith("cuda") else "cpu"
         self.use_amp = config.use_amp and self.device_type == "cuda"
         self.amp_dtype = torch.bfloat16 if (self.device_type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
@@ -106,7 +111,7 @@ class ARTrainer:
         input_ids, targets = x[:, :-1], x[:, 1:]
 
         with torch.autocast(device_type=self.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
-            logits, _ = self.model(input_ids)
+            logits, _ = self.model(input_ids)  # (B, L-1, V)
             loss = F.cross_entropy(
                 logits.reshape(-1, self.model.config.vocab_size),
                 targets.reshape(-1),
@@ -118,7 +123,12 @@ class ARTrainer:
 
     @torch.no_grad()
     def evaluate(self) -> tuple:
-        """Evaluate on validation data. Returns (loss, accuracy, tokens_per_sec)."""
+        """
+        Evaluate the model on validation data.
+
+        Returns:
+            (loss, accuracy, tokens_per_sec): average loss per token, accuracy, and throughput
+        """
         if self.eval_loader is None:
             return float("nan"), float("nan"), float("nan")
         self.model.eval()
@@ -135,6 +145,8 @@ class ARTrainer:
                     targets.reshape(-1),
                     reduction="sum",
                 )
+
+                # Compute accuracy
                 predictions = logits.argmax(dim=-1)
                 correct_tokens += (predictions == targets).sum().item()
 
@@ -207,6 +219,7 @@ class ARTrainer:
                     f"lr {lr:.2e} | {tps:.0f} tok/s"
                 )
 
+                # Log to Neptune
                 if self.neptune_run is not None:
                     try:
                         self.neptune_run["train/loss"].append(avg, step=self.global_step)
@@ -222,6 +235,7 @@ class ARTrainer:
                 val_ppl = math.exp(min(val_loss, 20))
                 logger.info(f"  eval loss={val_loss:.4f} ppl={val_ppl:.2f} acc={val_acc:.4f} | {val_tps:.0f} tok/s")
 
+                # Log to Neptune
                 if self.neptune_run is not None:
                     try:
                         self.neptune_run["val/loss"].append(val_loss, step=self.global_step)
