@@ -400,11 +400,12 @@ class CARDTrainer:
         # Split: use first half as prefix, second half as target
         prefix_len = L // 2
         block_size = min(cfg.denoise_vis_block_size, L - prefix_len)
-        prefix = x0[:, :prefix_len]
+        prefix = x0[:, :prefix_len].to(dtype=self.amp_dtype)
         target = x0[:, prefix_len:prefix_len + block_size]
 
         # Encode prefix
         kv_caches = self.model.init_kv_caches(B, cfg.device, self.amp_dtype)
+        print(kv_caches.dtype, prefix.dtype)
         _, kv_caches = self.model(prefix, pos_offset=0, kv_caches=kv_caches)
 
         # Initialize block with all [MASK]
